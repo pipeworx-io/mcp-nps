@@ -38,6 +38,49 @@ interface McpToolExport {
 
 const BASE_URL = 'https://developer.nps.gov/api/v1';
 
+// Visitor Use Statistics service — KEYLESS, separate from developer.nps.gov.
+const VISITATION_BASE = 'https://irmaservices.nps.gov/v3/rest/stats';
+
+// Forgiving park NAME → 4-letter unit code map (codes ARE the developer.nps.gov parkCodes).
+const PARK_ALIASES: Record<string, string> = {
+  yellowstone: 'YELL',
+  'grand canyon': 'GRCA',
+  'great smoky mountains': 'GRSM',
+  'great smokies': 'GRSM',
+  smokies: 'GRSM',
+  yosemite: 'YOSE',
+  zion: 'ZION',
+  acadia: 'ACAD',
+  'rocky mountain': 'ROMO',
+  'grand teton': 'GRTE',
+  glacier: 'GLAC',
+  olympic: 'OLYM',
+  'joshua tree': 'JOTR',
+  arches: 'ARCH',
+  bryce: 'BRCA',
+  'bryce canyon': 'BRCA',
+  'death valley': 'DEVA',
+  everglades: 'EVER',
+  sequoia: 'SEQU',
+  denali: 'DENA',
+  shenandoah: 'SHEN',
+  badlands: 'BADL',
+  'big bend': 'BIBE',
+};
+
+function resolveUnitCode(park: string): string {
+  const raw = park.trim();
+  // A bare 4-letter code (any case) passes straight through.
+  if (/^[A-Za-z]{4}$/.test(raw)) return raw.toUpperCase();
+  const key = raw.toLowerCase().replace(/\bnational park\b/g, '').replace(/\bnp\b/g, '').replace(/\s+/g, ' ').trim();
+  if (PARK_ALIASES[key]) return PARK_ALIASES[key];
+  // Last-ditch: if after stripping it's a 4-letter token, use it.
+  if (/^[A-Za-z]{4}$/.test(key)) return key.toUpperCase();
+  throw new Error(
+    `Could not resolve park "${park}" to a 4-letter NPS unit code. Pass a code directly (e.g., "YELL", "GRCA", "GRSM") or a known park name (yellowstone, grand canyon, great smoky mountains, yosemite, zion, acadia, ...).`,
+  );
+}
+
 const tools: McpToolExport['tools'] = [
   {
     name: 'list_parks',
@@ -112,9 +155,31 @@ const tools: McpToolExport['tools'] = [
       required: [],
     },
   },
+  {
+    name: 'nps_visitation',
+    description:
+      'National park visitor statistics — how many people visited a park. Answers "how many people visited Yellowstone", "NPS visitation numbers", "annual visitors to Grand Canyon", "busiest national park", "park attendance by month". Monthly + annual recreation and total visitor counts from the NPS Visitor Use Statistics service (keyless). Pass a park name or 4-letter code (e.g., YELL, GRCA, GRSM) and a year, or system_total:true for the whole national park system. Example: {"park":"yellowstone","year":2023}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        park: {
+          type: 'string',
+          description: 'Park name or 4-letter NPS unit code (e.g., "yellowstone", "grand canyon", "YELL", "GRCA", "GRSM"). Omit when system_total is true.',
+        },
+        year: { type: 'number', description: 'Calendar year (default: most recent complete year). Data lags ~6-12 months.' },
+        start_year: { type: 'number', description: 'Optional range start year (inclusive).' },
+        end_year: { type: 'number', description: 'Optional range end year (inclusive).' },
+        system_total: { type: 'boolean', description: 'If true, return system-wide totals across all NPS units for the year instead of a single park.' },
+      },
+      required: [],
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  // Visitor Use Statistics is keyless — handle before the developer.nps.gov key gate.
+  if (name === 'nps_visitation') return npsVisitation(args);
+
   const apiKey = (args._apiKey as string | undefined)?.trim();
   if (!apiKey) {
     throw new Error(
@@ -363,6 +428,128 @@ async function listThingsToDo(apiKey: string, args: Record<string, unknown>) {
       topics: (t.topics ?? []).map((t2) => t2.name).filter(Boolean),
       url: t.url ?? null,
     })),
+  };
+}
+
+interface MonthRow {
+  month: number;
+  recreation_visitors: number;
+  non_recreation_visitors: number;
+}
+
+function parseVisitationXml(xml: string): { unitCode: string | null; unitName: string | null; rows: MonthRow[] } {
+  const rows: MonthRow[] = [];
+  let unitCode: string | null = null;
+  let unitName: string | null = null;
+  const blocks = xml.match(/<VisitationData>[\s\S]*?<\/VisitationData>/g) ?? [];
+  for (const block of blocks) {
+    const num = (tag: string): number => {
+      const m = block.match(new RegExp(`<${tag}>([0-9-]+)</${tag}>`));
+      return m ? Number(m[1]) : 0;
+    };
+    const str = (tag: string): string | null => {
+      const m = block.match(new RegExp(`<${tag}>([^<]*)</${tag}>`));
+      return m ? m[1] : null;
+    };
+    if (unitCode === null) unitCode = str('UnitCode');
+    if (unitName === null) unitName = str('UnitName');
+    rows.push({
+      month: num('Month'),
+      recreation_visitors: num('RecreationVisitors'),
+      non_recreation_visitors: num('NonRecreationVisitors'),
+    });
+  }
+  rows.sort((a, b) => a.month - b.month);
+  return { unitCode, unitName, rows };
+}
+
+async function fetchVisitationXml(url: string): Promise<string> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/xml' }, signal: ctrl.signal });
+    if (res.status === 404) {
+      throw new Error('NPS visitation: not found (HTTP 404) — check the park code; visitation data lags ~6-12 months, try an earlier year.');
+    }
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`NPS visitation error: ${res.status} ${body.slice(0, 200)}`);
+    }
+    return await res.text();
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') throw new Error('NPS visitation: request timed out after 8s.');
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+const SOURCE = 'NPS Visitor Use Statistics (irmaservices.nps.gov), keyless';
+
+async function npsVisitation(args: Record<string, unknown>) {
+  const mostRecentComplete = new Date().getUTCFullYear() - 1;
+  const systemTotal = args.system_total === true || (!args.park && args.system_total !== false);
+
+  // Year resolution: explicit year, or start/end range, else most recent complete year.
+  const startYear = args.start_year != null ? Number(args.start_year) : args.year != null ? Number(args.year) : mostRecentComplete;
+  const endYear = args.end_year != null ? Number(args.end_year) : args.year != null ? Number(args.year) : startYear;
+
+  if (systemTotal) {
+    // System-wide: /stats/total/{year} per year (returns the same ArrayOfVisitationData XML).
+    const years: unknown[] = [];
+    let grandRec = 0;
+    let grandTotal = 0;
+    for (let y = startYear; y <= endYear; y++) {
+      const xml = await fetchVisitationXml(`${VISITATION_BASE}/total/${y}`);
+      const { rows } = parseVisitationXml(xml);
+      if (!rows.length) {
+        throw new Error(`NPS visitation: no system total for ${y} — data lags ~6-12 months, try an earlier year.`);
+      }
+      const annualRec = rows.reduce((s, r) => s + r.recreation_visitors, 0);
+      const annualTotal = rows.reduce((s, r) => s + r.recreation_visitors + r.non_recreation_visitors, 0);
+      grandRec += annualRec;
+      grandTotal += annualTotal;
+      years.push({ year: y, monthly: rows, annual_recreation_visitors: annualRec, annual_total_visitors: annualTotal });
+    }
+    return {
+      scope: 'system_total',
+      park_code: null,
+      park_name: 'All NPS units (system-wide)',
+      year: startYear === endYear ? startYear : undefined,
+      years: startYear === endYear ? undefined : years.map((y) => (y as { year: number }).year),
+      monthly: startYear === endYear ? (years[0] as { monthly: MonthRow[] }).monthly : undefined,
+      per_year: startYear === endYear ? undefined : years,
+      annual_recreation_visitors: grandRec,
+      annual_total_visitors: grandTotal,
+      source: SOURCE,
+    };
+  }
+
+  const unitCode = resolveUnitCode(String(args.park ?? ''));
+  const url =
+    `${VISITATION_BASE}/visitation?unitCodes=${unitCode}` +
+    `&startMonth=1&startYear=${startYear}&endMonth=12&endYear=${endYear}`;
+  const xml = await fetchVisitationXml(url);
+  const { unitName, rows } = parseVisitationXml(xml);
+  if (!rows.length) {
+    throw new Error(
+      `NPS visitation: no data for "${unitCode}" ${startYear}${endYear !== startYear ? `-${endYear}` : ''} — check the park code; visitation data lags ~6-12 months, try an earlier year.`,
+    );
+  }
+  const annualRec = rows.reduce((s, r) => s + r.recreation_visitors, 0);
+  const annualTotal = rows.reduce((s, r) => s + r.recreation_visitors + r.non_recreation_visitors, 0);
+  const single = startYear === endYear;
+  return {
+    scope: 'park',
+    park_code: unitCode,
+    park_name: unitName ?? null,
+    year: single ? startYear : undefined,
+    start_year: single ? undefined : startYear,
+    end_year: single ? undefined : endYear,
+    monthly: rows,
+    annual_recreation_visitors: annualRec,
+    annual_total_visitors: annualTotal,
+    source: SOURCE,
   };
 }
 

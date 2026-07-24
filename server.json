@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/nps",
   "title": "Nps",
   "description": "NPS MCP — US National Park Service (free key, generous limits)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/nps",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-nps",

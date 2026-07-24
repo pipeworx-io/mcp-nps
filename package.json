@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-nps",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "NPS MCP — US National Park Service (free key, generous limits)",
   "type": "module",
   "main": "src/index.ts",
